@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Redirect},
     routing::{get, post},
 };
+use cached::proc_macro::cached;
 use redis::{AsyncCommands, Client};
 use serde::Deserialize;
 use serde_json::json;
@@ -83,29 +84,30 @@ async fn route_handler(
     Path(path): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let mut conn = state
-        .client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get connection: {}", e)})),
-            )
-        })?;
-
-    println!("Received request for path: /{}", path);
-    let result: String = conn.get(format!("/{}", path)).await.map_err(|e| {
+    println!("Received request for path: {}", path);
+    let result = get_url_mapping(&path, &state).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to get key: {}", e)})),
+            Json(json!({"error": format!("Failed to get URL mapping: {}", e)})),
         )
     })?;
 
-    if !(result.starts_with("http://") || result.starts_with("https://")) {
-        println!("Redirecting to: {}", result);
-        return Ok(Redirect::to(&format!("http://{}", result)));
+    Ok(Redirect::to(&result))
+}
+
+#[cached(
+    result = true, // only cache successful results, if err occurs, it will not be cached and retry
+    key = "String",
+    convert = r#"{ path.to_string() }"#,
+    time = 60
+)]
+async fn get_url_mapping(path: &str, state: &AppState) -> Result<String, redis::RedisError> {
+    let mut conn = state.client.get_multiplexed_async_connection().await?;
+    let url: String = conn.get(format!("/{}", path)).await?;
+
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Ok(format!("http://{}", url));
     }
 
-    Ok(Redirect::to(&result))
+    Ok(url)
 }
