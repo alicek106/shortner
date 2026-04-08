@@ -7,7 +7,7 @@ use axum::{
 
 // warning!!
 // AI-generated HTML code
-pub async fn handler() -> impl IntoResponse {
+pub async fn root_handler() -> impl IntoResponse {
     axum::response::Html(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -97,11 +97,11 @@ pub async fn handler() -> impl IntoResponse {
     <h1>🔗 URL Shortener</h1>
     <p class="subtitle">Map any URL to a short path instantly.</p>
 
-    <label for="old_url">Short path (e.g. <code>/go</code>)</label>
-    <input type="text" id="old_url" placeholder="/my-link" />
-
     <label for="new_url">Destination URL</label>
     <input type="text" id="new_url" placeholder="https://example.com/very/long/url" />
+
+    <label for="old_url">Short path (e.g. <code>/go</code>)</label>
+    <input type="text" id="old_url" placeholder="/my-link" />
 
     <button onclick="create()">Create</button>
     <div id="msg"></div>

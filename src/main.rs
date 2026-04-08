@@ -1,38 +1,41 @@
-mod handler;
+mod pages;
 use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    response::{IntoResponse, Redirect},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use cached::proc_macro::cached;
 use redis::{AsyncCommands, Client};
 use serde::Deserialize;
 use serde_json::json;
+use std::env;
 
 #[derive(Clone)]
 struct AppState {
-    client: Client,
+    conn: redis::aio::MultiplexedConnection,
 }
-
-// TODO: funcache 달아서 매번 redis 매번 안쳐도 되도록 만들기
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // TODO: config parser로 빼기
-    let client = redis::Client::open("redis://10.200.0.4/")?;
+    tracing_subscriber::fmt::init();
 
-    let state = AppState { client };
+    let redis_addr = env::var("REDIS_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+
+    let client = redis::Client::open(format!("redis://{}", redis_addr))?;
+    let conn = client.get_multiplexed_async_connection().await?;
+    let state = AppState { conn };
 
     let app = Router::new()
-        .route("/", get(handler::handler))
+        .route("/", get(pages::root_handler))
         .route("/new", post(new_handler))
         .route("/{*rest}", get(route_handler))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    println!("listening on {}", listener.local_addr()?);
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    tracing::info!("listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -40,58 +43,66 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Debug, Deserialize)]
 struct UrlMapping {
-    old_url: String,
-    new_url: String,
+    short_path: String,
+    dest_url: String,
+}
+
+enum AppError {
+    Redis(redis::RedisError),
+    NotFound,
+    BadRequest(&'static str),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, msg) = match self {
+            AppError::Redis(e) => {
+                tracing::error!("Redis error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+            }
+            AppError::NotFound => (StatusCode::NOT_FOUND, "URL mapping not found"),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+        };
+        (status, Json(json!({"error": msg}))).into_response()
+    }
 }
 
 async fn new_handler(
     // 두 개 순서가 뒤바뀌면 trait bound 에러가 발생하니 주의....
     State(state): State<AppState>,
-    Json(payload): Json<UrlMapping>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    println!(
-        "Setting mapping: {} -> {}",
-        payload.old_url, payload.new_url
-    );
+    Json(mut payload): Json<UrlMapping>,
+) -> Result<impl IntoResponse, AppError> {
+    if payload.short_path.trim().is_empty() || payload.dest_url.trim().is_empty() {
+        tracing::warn!("Received invalid payload: {:?}", payload);
+        return Err(AppError::BadRequest(
+            "Both short_path and dest_url must be provided",
+        ));
+    }
 
-    let mut conn = state
-        .client
-        .get_multiplexed_async_connection()
+    if !payload.short_path.starts_with('/') {
+        payload.short_path = format!("/{}", payload.short_path);
+    }
+
+    if url::Url::parse(&payload.dest_url).is_err() {
+        tracing::warn!("Received invalid dest_url: {}", payload.dest_url);
+        return Err(AppError::BadRequest("dest_url must be a valid URL"));
+    }
+
+    state
+        .conn
+        .clone()
+        .set::<_, _, ()>(payload.short_path, payload.dest_url)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to get connection: {}", e)})),
-            )
-        })?;
+        .map_err(AppError::Redis)?;
 
-    conn.set::<_, _, ()>(payload.old_url, payload.new_url)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Failed to set key: {}", e)})),
-            )
-        })?;
-
-    Ok((
-        StatusCode::OK,
-        Json(json!({"message": "URL mapping received"})),
-    ))
+    Ok(Json(json!({"message": "URL mapping received"})))
 }
 
 async fn route_handler(
     Path(path): Path<String>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    println!("Received request for path: {}", path);
-    let result = get_url_mapping(&path, &state).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Failed to get URL mapping: {}", e)})),
-        )
-    })?;
-
+) -> Result<impl IntoResponse, AppError> {
+    let result = get_dest_url(&path, &state).await?;
     Ok(Redirect::to(&result))
 }
 
@@ -101,13 +112,15 @@ async fn route_handler(
     convert = r#"{ path.to_string() }"#,
     time = 60
 )]
-async fn get_url_mapping(path: &str, state: &AppState) -> Result<String, redis::RedisError> {
-    let mut conn = state.client.get_multiplexed_async_connection().await?;
-    let url: String = conn.get(format!("/{}", path)).await?;
-
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Ok(format!("http://{}", url));
+async fn get_dest_url(path: &str, state: &AppState) -> Result<String, AppError> {
+    let url: Option<String> = state
+        .conn
+        .clone()
+        .get(path)
+        .await
+        .map_err(AppError::Redis)?;
+    match url {
+        Some(u) => Ok(u),
+        None => Err(AppError::NotFound),
     }
-
-    Ok(url)
 }
