@@ -7,7 +7,8 @@ use axum::{
     routing::{get, post},
 };
 use cached::proc_macro::cached;
-use redis::{AsyncCommands, Client};
+use rand::distr::{Alphanumeric, SampleString};
+use redis::AsyncCommands;
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
@@ -43,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Debug, Deserialize)]
 struct UrlMapping {
-    short_path: String,
+    short_path: Option<String>,
     dest_url: String,
 }
 
@@ -70,39 +71,45 @@ impl IntoResponse for AppError {
 async fn new_handler(
     // 두 개 순서가 뒤바뀌면 trait bound 에러가 발생하니 주의....
     State(state): State<AppState>,
-    Json(mut payload): Json<UrlMapping>,
+    Json(payload): Json<UrlMapping>,
 ) -> Result<impl IntoResponse, AppError> {
-    if payload.short_path.trim().is_empty() || payload.dest_url.trim().is_empty() {
-        tracing::warn!("Received invalid payload: {:?}", payload);
-        return Err(AppError::BadRequest(
-            "Both short_path and dest_url must be provided",
-        ));
-    }
-
-    if !payload.short_path.starts_with('/') {
-        payload.short_path = format!("/{}", payload.short_path);
-    }
-
     if url::Url::parse(&payload.dest_url).is_err() {
         tracing::warn!("Received invalid dest_url: {}", payload.dest_url);
         return Err(AppError::BadRequest("dest_url must be a valid URL"));
     }
 
+    let final_short_path = match payload.short_path {
+        Some(short_path) => {
+            if short_path.trim().is_empty() || short_path.eq("/") {
+                tracing::warn!("Received invalid short_path: {:?}", short_path);
+                return Err(AppError::BadRequest("Invalid short path."));
+            }
+
+            match short_path {
+                s if s.starts_with('/') => format!("/{}", s),
+                _ => short_path,
+            }
+        }
+        None => format!("/{}", Alphanumeric.sample_string(&mut rand::rng(), 16)),
+    };
+
     state
         .conn
         .clone()
-        .set::<_, _, ()>(payload.short_path, payload.dest_url)
+        .set::<_, _, ()>(&final_short_path, payload.dest_url)
         .await
         .map_err(AppError::Redis)?;
 
-    Ok(Json(json!({"message": "URL mapping received"})))
+    Ok(Json(
+        json!({"message": "URL mapping received", "short_url": final_short_path}),
+    ))
 }
 
 async fn route_handler(
     Path(path): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, AppError> {
-    let result = get_dest_url(&path, &state).await?;
+    let result = get_dest_url(&format!("/{}", path), &state).await?;
     Ok(Redirect::to(&result))
 }
 
