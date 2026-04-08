@@ -16,6 +16,7 @@ use std::env;
 #[derive(Clone)]
 struct AppState {
     conn: redis::aio::MultiplexedConnection,
+    redis_random_key_conflict_max_retry: i32,
 }
 
 #[tokio::main]
@@ -24,10 +25,16 @@ async fn main() -> anyhow::Result<()> {
 
     let redis_addr = env::var("REDIS_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let redis_random_key_conflict_max_retry: i32 = env::var("REDIS_RANDOM_KEY_CONFLICT_MAX_RETRY")
+        .unwrap_or_else(|_| "10".to_string())
+        .parse()?;
 
     let client = redis::Client::open(format!("redis://{}", redis_addr))?;
     let conn = client.get_multiplexed_async_connection().await?;
-    let state = AppState { conn };
+    let state = AppState {
+        conn,
+        redis_random_key_conflict_max_retry,
+    };
 
     let app = Router::new()
         .route("/", get(pages::root_handler))
@@ -52,6 +59,7 @@ enum AppError {
     Redis(redis::RedisError),
     NotFound,
     BadRequest(&'static str),
+    RedisKeyConflict, // random generated key를 했는데 중복으로 인해 실패한 경우. 보통은 발생하지 않아야 한다.
 }
 
 impl IntoResponse for AppError {
@@ -63,6 +71,9 @@ impl IntoResponse for AppError {
             }
             AppError::NotFound => (StatusCode::NOT_FOUND, "URL mapping not found"),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            AppError::RedisKeyConflict => {
+                (StatusCode::CONFLICT, "Generated short path not allocated.")
+            }
         };
         (status, Json(json!({"error": msg}))).into_response()
     }
@@ -90,7 +101,7 @@ async fn new_handler(
                 _ => short_path,
             }
         }
-        None => format!("/{}", Alphanumeric.sample_string(&mut rand::rng(), 16)),
+        None => generate_random_short_path(&state).await?,
     };
 
     state
@@ -103,6 +114,22 @@ async fn new_handler(
     Ok(Json(
         json!({"message": "URL mapping received", "short_url": final_short_path}),
     ))
+}
+
+async fn generate_random_short_path(app_state: &AppState) -> Result<String, AppError> {
+    for _ in 0..app_state.redis_random_key_conflict_max_retry {
+        let generated = format!("/{}", Alphanumeric.sample_string(&mut rand::rng(), 16));
+        let exist: bool = app_state
+            .conn
+            .clone()
+            .exists::<String, bool>(generated.clone())
+            .await
+            .map_err(AppError::Redis)?;
+        if !exist {
+            return Ok(generated);
+        }
+    }
+    Err(AppError::RedisKeyConflict)
 }
 
 async fn route_handler(
