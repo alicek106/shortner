@@ -55,6 +55,7 @@ struct UrlMapping {
     dest_url: String,
 }
 
+#[derive(Clone)]
 enum AppError {
     Redis(redis::RedisError),
     NotFound,
@@ -141,7 +142,7 @@ async fn route_handler(
 }
 
 #[cached(
-    result = true, // only cache successful results, if err occurs, it will not be cached and retry
+    result = false, // 존재하지 않는 url로 여러 번 요청하면 캐싱하도록
     key = "String",
     convert = r#"{ path.to_string() }"#,
     time = 60
